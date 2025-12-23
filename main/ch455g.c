@@ -220,13 +220,18 @@ esp_err_t ch455g_show_hhmm(ch455g_t *dev, int hour, int minute)
     int m1 = minute / 10;
     int m2 = minute % 10;
 
-    // Assumption: DIG3..DIG0 is left->right wiring (common on clocks)
-    uint8_t dig3 = seg_for_digit(h1);
-    uint8_t dig2 = seg_for_digit(h2);
-    uint8_t dig1 = seg_for_digit(m1);
-    uint8_t dig0 = seg_for_digit(m2);
+    // Hardware wiring confirmed in-field: DIG0..DIG3 is left->right.
+    // Example: 15:40 should display as 1 5 4 0.
+    uint8_t dig0 = seg_for_digit(h1);
+    uint8_t dig1 = seg_for_digit(h2);
+    uint8_t dig2 = seg_for_digit(m1);
+    uint8_t dig3 = seg_for_digit(m2);
 
-    // Write DIG0..DIG3
+    // Middle separator wiring varies by module.
+    // Per latest hardware confirmation: there is NO dedicated colon; only a single DP dot is available.
+    // Use a single dot between hour and minute by enabling DP on the center-left digit (hours units).
+    dig1 |= 0x80;
+
     return ch455g_set_4digits_raw(dev, dig0, dig1, dig2, dig3);
 }
 

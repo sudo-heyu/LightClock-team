@@ -21,6 +21,7 @@
 #include "pwm_led.h"
 #include "timekeeper.h"
 #include "ble_alarm.h"
+#include "battery.h"
 
 static const char *TAG = "APP";
 
@@ -35,7 +36,7 @@ static const char *TAG = "APP";
 // Behavior constants
 #define LONG_PRESS_MS            2000
 #define TIME_SHOW_MS             (CONFIG_LIGHT_ALARM_TIME_SHOW_SECONDS * 1000)
-#define ALARM_GRADIENT_MS        (CONFIG_LIGHT_ALARM_GRADIENT_MINUTES * 60 * 1000)
+#define DEFAULT_SUNRISE_MINUTES_FALLBACK (CONFIG_LIGHT_ALARM_GRADIENT_MINUTES)
 #define BLE_IDLE_SLEEP_DELAY_MS  3000
 
 typedef enum {
@@ -60,9 +61,47 @@ typedef struct {
     bool ble_inited;
     bool ble_adv_running;
 
+    battery_t batt;
+    bool batt_inited;
+    esp_timer_handle_t batt_notify_timer;
+
     bool sleep_requested;
     int64_t sleep_at_us;
+
+    time_t next_alarm_ts;
 } app_ctx_t;
+
+#define GPIO_BAT_ADC      GPIO_NUM_3
+
+static void batt_notify_timer_cb(void *arg)
+{
+    app_ctx_t *app = (app_ctx_t *)arg;
+    if (!app || !app->batt_inited) {
+        return;
+    }
+    if (!ble_alarm_is_connected()) {
+        return;
+    }
+    uint8_t pct = 0;
+    if (battery_read_percent(&app->batt, &pct) == ESP_OK) {
+        (void)ble_alarm_notify_battery(pct);
+    }
+}
+
+static void app_recompute_next_alarm(app_ctx_t *app)
+{
+    if (!app) {
+        return;
+    }
+    time_t now = time(NULL);
+    if (!timekeeper_is_time_sane(now)) {
+        app->next_alarm_ts = 0;
+        return;
+    }
+    int64_t seconds = timekeeper_seconds_until_next_alarm(&app->cfg, now);
+    app->next_alarm_ts = now + seconds;
+    ESP_LOGI(TAG, "next sunrise start in %llds (ts=%lld)", (long long)seconds, (long long)app->next_alarm_ts);
+}
 
 static void power_prep_for_sleep(void)
 {
@@ -138,6 +177,16 @@ static void app_enter_deep_sleep(app_ctx_t *app)
         app->ble_adv_running = false;
     }
 
+    if (app->batt_notify_timer) {
+        (void)esp_timer_stop(app->batt_notify_timer);
+        (void)esp_timer_delete(app->batt_notify_timer);
+        app->batt_notify_timer = NULL;
+    }
+    if (app->batt_inited) {
+        battery_deinit(&app->batt);
+        app->batt_inited = false;
+    }
+
     power_prep_for_sleep();
 
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
@@ -184,6 +233,34 @@ static void app_periph_ensure_pwm(app_ctx_t *app)
     }
 }
 
+static void app_apply_light_linear_mix(app_ctx_t *app, uint8_t total_brightness_0_100, uint8_t color_temp_0_100)
+{
+    if (!app) {
+        return;
+    }
+    if (total_brightness_0_100 > 100) {
+        total_brightness_0_100 = 100;
+    }
+    if (color_temp_0_100 > 100) {
+        color_temp_0_100 = 100;
+    }
+
+    // Linear fit/mix:
+    //  - color_temp=0   => 100% cool
+    //  - color_temp=100 => 100% warm
+    // Keep warm+cool == total_brightness.
+    uint16_t warm = (uint16_t)total_brightness_0_100 * (uint16_t)color_temp_0_100;
+    warm = (warm + 50) / 100; // rounded
+    if (warm > total_brightness_0_100) {
+        warm = total_brightness_0_100;
+    }
+    uint8_t warm_u8 = (uint8_t)warm;
+    uint8_t cool_u8 = (uint8_t)(total_brightness_0_100 - warm_u8);
+
+    app_periph_ensure_pwm(app);
+    (void)pwm_led_set_percent(&app->pwm, warm_u8, cool_u8);
+}
+
 static bool ble_on_write(const uint8_t hhmm4[4], void *ctx)
 {
     app_ctx_t *app = (app_ctx_t *)ctx;
@@ -192,10 +269,15 @@ static bool ble_on_write(const uint8_t hhmm4[4], void *ctx)
         return false;
     }
 
-    app->cfg = new_cfg;
+    // Merge alarm fields only; keep other persisted settings.
+    app->cfg.alarm_hour = new_cfg.alarm_hour;
+    app->cfg.alarm_minute = new_cfg.alarm_minute;
     (void)device_config_save(&app->cfg);
 
     ESP_LOGI(TAG, "alarm updated to %02u%02u", app->cfg.alarm_hour, app->cfg.alarm_minute);
+
+    // If we are staying awake (ALWAYS_ON), update next-alarm schedule immediately.
+    app_recompute_next_alarm(app);
 
 #if !CONFIG_LIGHT_ALARM_ALWAYS_ON
     // After successful write: disconnect then sleep a few seconds later.
@@ -204,6 +286,93 @@ static bool ble_on_write(const uint8_t hhmm4[4], void *ctx)
 #endif
 
     return true;
+}
+
+static bool ble_on_write_color_temp(uint8_t value_0_100, void *ctx)
+{
+    app_ctx_t *app = (app_ctx_t *)ctx;
+    if (!app || value_0_100 > 100) {
+        return false;
+    }
+    app->cfg.color_temp = value_0_100;
+    (void)device_config_save(&app->cfg);
+    ESP_LOGI(TAG, "color temp updated to %u (0=cool..100=warm)", (unsigned)app->cfg.color_temp);
+    return true;
+}
+
+static bool ble_on_write_wake_bright(uint8_t value_0_100, void *ctx)
+{
+    app_ctx_t *app = (app_ctx_t *)ctx;
+    if (!app || value_0_100 > 100) {
+        return false;
+    }
+    app->cfg.wake_bright = value_0_100;
+    (void)device_config_save(&app->cfg);
+    ESP_LOGI(TAG, "wake bright updated to %u", (unsigned)app->cfg.wake_bright);
+    return true;
+}
+
+static bool ble_on_write_sunrise_duration(uint8_t minutes_5_60, void *ctx)
+{
+    app_ctx_t *app = (app_ctx_t *)ctx;
+    if (!app || minutes_5_60 < 5 || minutes_5_60 > 60) {
+        return false;
+    }
+    app->cfg.sunrise_duration = minutes_5_60;
+    (void)device_config_save(&app->cfg);
+    ESP_LOGI(TAG, "sunrise duration updated to %u minutes", (unsigned)app->cfg.sunrise_duration);
+
+    // Schedule changed -> recompute immediately.
+    app_recompute_next_alarm(app);
+    return true;
+}
+
+static bool ble_on_time_sync(const uint8_t hhmmss6[6], void *ctx)
+{
+    app_ctx_t *app = (app_ctx_t *)ctx;
+    if (!app || !hhmmss6) {
+        return false;
+    }
+
+    for (int i = 0; i < 6; i++) {
+        if (hhmmss6[i] < '0' || hhmmss6[i] > '9') {
+            return false;
+        }
+    }
+
+    uint8_t hh = (uint8_t)((hhmmss6[0] - '0') * 10 + (hhmmss6[1] - '0'));
+    uint8_t mm = (uint8_t)((hhmmss6[2] - '0') * 10 + (hhmmss6[3] - '0'));
+    uint8_t ss = (uint8_t)((hhmmss6[4] - '0') * 10 + (hhmmss6[5] - '0'));
+
+    if (!timekeeper_set_local_hhmmss(hh, mm, ss)) {
+        return false;
+    }
+
+    ESP_LOGI(TAG, "time synced to %02u:%02u:%02u", (unsigned)hh, (unsigned)mm, (unsigned)ss);
+
+    // Time changed -> recompute schedule immediately.
+    app_recompute_next_alarm(app);
+
+#if !CONFIG_LIGHT_ALARM_ALWAYS_ON
+    // After successful time sync: disconnect then sleep a few seconds later.
+    app_request_sleep_ms(app, BLE_IDLE_SLEEP_DELAY_MS);
+    (void)ble_alarm_disconnect();
+#endif
+
+    return true;
+}
+
+static uint8_t ble_on_batt_read(void *ctx)
+{
+    app_ctx_t *app = (app_ctx_t *)ctx;
+    if (!app || !app->batt_inited) {
+        return 0;
+    }
+    uint8_t pct = 0;
+    if (battery_read_percent(&app->batt, &pct) != ESP_OK) {
+        return 0;
+    }
+    return pct;
 }
 
 static void ble_on_read(uint8_t out_hhmm4[4], void *ctx)
@@ -230,8 +399,32 @@ static void ble_on_disconnect(void *ctx)
 static void app_ble_ensure_adv(app_ctx_t *app)
 {
     if (!app->ble_inited) {
-        ESP_ERROR_CHECK(ble_alarm_init(ble_on_write, ble_on_read, NULL, ble_on_disconnect, app));
+        ESP_ERROR_CHECK(ble_alarm_init(ble_on_write,
+                                       ble_on_read,
+                                       ble_on_time_sync,
+                                       ble_on_batt_read,
+                                       ble_on_write_color_temp,
+                                       ble_on_write_wake_bright,
+                                       ble_on_write_sunrise_duration,
+                                       NULL,
+                                       ble_on_disconnect,
+                                       app));
         app->ble_inited = true;
+
+        // Start a periodic battery notify while awake; ble_alarm will only send when CCCD enabled.
+        if (!app->batt_notify_timer) {
+            const esp_timer_create_args_t args = {
+                .callback = &batt_notify_timer_cb,
+                .arg = app,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "batt_notify",
+                .skip_unhandled_events = true,
+            };
+            (void)esp_timer_create(&args, &app->batt_notify_timer);
+            if (app->batt_notify_timer) {
+                (void)esp_timer_start_periodic(app->batt_notify_timer, 60ULL * 1000000ULL);
+            }
+        }
     }
     (void)ble_alarm_start_advertising();
     app->ble_adv_running = true;
@@ -270,15 +463,70 @@ static void app_run_alarm_gradient(app_ctx_t *app)
     app_periph_ensure_display(app);
     app_periph_ensure_pwm(app);
 
+    uint8_t sunrise_min = app->cfg.sunrise_duration;
+    if (sunrise_min < 5 || sunrise_min > 60) {
+        sunrise_min = (uint8_t)DEFAULT_SUNRISE_MINUTES_FALLBACK;
+        if (sunrise_min < 5) sunrise_min = 5;
+        if (sunrise_min > 60) sunrise_min = 60;
+    }
+
+    int64_t total_ms = (int64_t)sunrise_min * 60 * 1000;
+
+    // Best-effort: if we woke late (after scheduled sunrise start), shorten to remaining time until alarm.
+    time_t now_s = time(NULL);
+    if (timekeeper_is_time_sane(now_s)) {
+        struct tm local;
+        localtime_r(&now_s, &local);
+        struct tm target = local;
+        target.tm_hour = app->cfg.alarm_hour;
+        target.tm_min = app->cfg.alarm_minute;
+        target.tm_sec = 0;
+        time_t alarm_t = mktime(&target);
+        if (alarm_t >= 0) {
+            if (alarm_t <= now_s) {
+                alarm_t += 24 * 60 * 60;
+            }
+            int64_t remain_ms = ((int64_t)(alarm_t - now_s)) * 1000;
+            if (remain_ms > 0 && remain_ms < total_ms) {
+                total_ms = remain_ms;
+            }
+        }
+    }
+
     int64_t start_us = esp_timer_get_time();
-    int64_t end_us = start_us + (int64_t)ALARM_GRADIENT_MS * 1000;
+    int64_t end_us = start_us + total_ms * 1000;
 
     while (esp_timer_get_time() < end_us) {
         int64_t now_us = esp_timer_get_time();
         int64_t elapsed_ms = (now_us - start_us) / 1000;
-        uint8_t pct = (uint8_t)((elapsed_ms >= ALARM_GRADIENT_MS) ? 100 : (elapsed_ms * 100 / ALARM_GRADIENT_MS));
+        // Use ceil division so PWM doesn't stay at 0% for a long time at the beginning.
+        uint8_t pct = 0;
+        if (elapsed_ms <= 0) {
+            pct = 0;
+        } else if (elapsed_ms >= total_ms) {
+            pct = 100;
+        } else {
+            pct = (uint8_t)((elapsed_ms * 100 + (total_ms - 1)) / total_ms);
+            if (pct > 100) {
+                pct = 100;
+            }
+        }
 
-        (void)pwm_led_set_percent(&app->pwm, pct, pct);
+        // Scale gradient by configured wake max brightness.
+        uint8_t target = app->cfg.wake_bright;
+        if (target > 100) {
+            target = 100;
+        }
+        uint8_t brightness = 0;
+        if (pct == 0 || target == 0) {
+            brightness = 0;
+        } else {
+            brightness = (uint8_t)((pct * target + 99) / 100); // ceil so it's visible early
+            if (brightness > target) {
+                brightness = target;
+            }
+        }
+        app_apply_light_linear_mix(app, brightness, app->cfg.color_temp);
         app_display_show_now(app);
 
         // short press cancels alarm -> deep sleep
@@ -295,7 +543,12 @@ static void app_run_alarm_gradient(app_ctx_t *app)
     (void)ch455g_clear(&app->disp);
     (void)ch455g_set_enabled(&app->disp, false);
 
+#if CONFIG_LIGHT_ALARM_ALWAYS_ON
+    // Debug ALWAYS_ON: do not enter deep sleep; return to main loop.
+    return;
+#else
     app_enter_deep_sleep(app);
+#endif
 }
 
 static void app_run_manual_light(app_ctx_t *app)
@@ -305,12 +558,16 @@ static void app_run_manual_light(app_ctx_t *app)
     app_periph_ensure_display(app);
     app_periph_ensure_pwm(app);
 
-    (void)pwm_led_set_percent(&app->pwm, 100, 100);
+    // Manual light uses configured color temperature; brightness is fixed to 100%.
+    app_apply_light_linear_mix(app, 100, app->cfg.color_temp);
 
     int64_t adv_until_us = 0;
 
     for (;;) {
         app_display_show_now(app);
+
+        // Apply settings continuously so BLE writes take effect while staying in manual mode.
+        app_apply_light_linear_mix(app, 100, app->cfg.color_temp);
 
         button_event_t ev = button_poll(&app->btn);
         if (ev == BUTTON_EVENT_LONG) {
@@ -340,7 +597,12 @@ static void app_run_manual_light(app_ctx_t *app)
     (void)ch455g_clear(&app->disp);
     (void)ch455g_set_enabled(&app->disp, false);
 
+#if CONFIG_LIGHT_ALARM_ALWAYS_ON
+    // Debug ALWAYS_ON: do not enter deep sleep; return to caller loop.
+    return;
+#else
     app_enter_deep_sleep(app);
+#endif
 }
 
 static void app_run_always_on(app_ctx_t *app)
@@ -361,10 +623,40 @@ static void app_run_always_on(app_ctx_t *app)
     }
     ESP_LOGI(TAG, "ALWAYS_ON: adv=%d (after %d ms)", (int)ble_alarm_is_advertising(), waited_ms);
 
+    // Initialize next-alarm schedule while awake.
+    timekeeper_init_if_unset();
+    app_recompute_next_alarm(app);
+
     for (;;) {
+        // Alarm trigger while staying awake (ALWAYS_ON). This keeps the PWM wake-up behavior testable
+        // without deep sleep.
+        time_t now = time(NULL);
+        if (app->next_alarm_ts == 0 && timekeeper_is_time_sane(now)) {
+            app_recompute_next_alarm(app);
+        }
+        if (app->next_alarm_ts != 0 && timekeeper_is_time_sane(now) && now >= app->next_alarm_ts) {
+            ESP_LOGI(TAG, "ALWAYS_ON: alarm due -> start gradient");
+            app_run_alarm_gradient(app);
+            app_recompute_next_alarm(app);
+        }
+
+        // In ALWAYS_ON debug, also handle BTN so display/LED can be verified without deep sleep.
+        button_event_t ev = button_poll(&app->btn);
+        if (ev == BUTTON_EVENT_SHORT) {
+            ESP_LOGI(TAG, "ALWAYS_ON: short press -> show time");
+            app_run_show_time(app, TIME_SHOW_MS);
+        } else if (ev == BUTTON_EVENT_LONG) {
+            ESP_LOGI(TAG, "ALWAYS_ON: long press -> manual light toggle");
+            app_run_manual_light(app);
+        }
+
         // Periodic log so monitor has continuous output.
-        ESP_LOGI(TAG, "ALWAYS_ON tick: connected=%d adv=%d", (int)ble_alarm_is_connected(), (int)ble_alarm_is_advertising());
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        static int tick = 0;
+        tick++;
+        if ((tick % 10) == 0) {
+            ESP_LOGI(TAG, "ALWAYS_ON tick: connected=%d adv=%d", (int)ble_alarm_is_connected(), (int)ble_alarm_is_advertising());
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
@@ -395,6 +687,14 @@ void app_main(void)
     };
     gpio_config(&en);
     gpio_set_level(GPIO_BAT_ADC_EN, 0);
+
+    // Battery ADC (best-effort): used by BLE battery characteristic.
+    if (battery_init(&app.batt, GPIO_BAT_ADC, GPIO_BAT_ADC_EN) == ESP_OK) {
+        app.batt_inited = true;
+    } else {
+        ESP_LOGW(TAG, "battery init failed; battery characteristic will report 0%%");
+        app.batt_inited = false;
+    }
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "wakeup cause=%d", cause);

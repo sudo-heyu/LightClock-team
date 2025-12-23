@@ -83,6 +83,13 @@ int64_t timekeeper_seconds_until_next_alarm(const device_config_t *cfg, time_t n
         return 60;
     }
 
+    uint8_t sunrise_min = cfg->sunrise_duration;
+    if (sunrise_min < 5 || sunrise_min > 60) {
+        sunrise_min = DEVICE_CONFIG_DEFAULT_SUNRISE_DURATION_MINUTES;
+        if (sunrise_min < 5) sunrise_min = 5;
+        if (sunrise_min > 60) sunrise_min = 60;
+    }
+
     struct tm local;
     localtime_r(&now, &local);
 
@@ -100,9 +107,52 @@ int64_t timekeeper_seconds_until_next_alarm(const device_config_t *cfg, time_t n
         target_t += 24 * 60 * 60;
     }
 
-    int64_t delta = (int64_t)(target_t - now);
+    // Sunrise starts before the alarm.
+    time_t sunrise_t = target_t - (time_t)sunrise_min * 60;
+    if (sunrise_t <= now) {
+        // If we are already past today's sunrise start, schedule the next day.
+        // This avoids immediate re-trigger loops after the user cancels the sunrise simulation.
+        sunrise_t += 24 * 60 * 60;
+    }
+
+    int64_t delta = (int64_t)(sunrise_t - now);
     if (delta < 1) {
         delta = 1;
     }
     return delta;
+}
+
+bool timekeeper_set_local_hhmmss(uint8_t hour, uint8_t minute, uint8_t second)
+{
+    if (hour >= 24 || minute >= 60 || second >= 60) {
+        return false;
+    }
+
+    // Ensure we have at least a sane date.
+    timekeeper_init_if_unset();
+
+    time_t now = time(NULL);
+    if (!timekeeper_is_time_sane(now)) {
+        ESP_LOGW(TAG, "time still not sane after init; refusing to set HHMMSS");
+        return false;
+    }
+
+    struct tm local;
+    localtime_r(&now, &local);
+
+    local.tm_hour = hour;
+    local.tm_min = minute;
+    local.tm_sec = second;
+    local.tm_isdst = -1;
+
+    time_t t = mktime(&local);
+    if (t < 0) {
+        ESP_LOGW(TAG, "mktime failed while setting HHMMSS");
+        return false;
+    }
+
+    struct timeval tv = {.tv_sec = t, .tv_usec = 0};
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "RTC time set to %02u:%02u:%02u (local)", (unsigned)hour, (unsigned)minute, (unsigned)second);
+    return true;
 }
