@@ -1,0 +1,18 @@
+menu "Light Wake-up Alarm (BLE)"
+
+    config LIGHT_ALARM_CH455_INTENSITY
+        int "CH455 brightness level (0=max, 7=7/8)"
+        range 0 7
+        default 0
+
+    config LIGHT_ALARM_TIME_SHOW_SECONDS
+        int "Short-press time display duration (seconds)"
+        range 5 120
+        default 20
+
+    config LIGHT_ALARM_GRADIENT_MINUTES
+        int "Alarm sunrise gradient duration (minutes)"
+        range 5 60
+        default 30
+
+endmenu
