@@ -13,7 +13,7 @@
 
 static const char *TAG = "BLE";
 
-#define DEVICE_NAME_DEFAULT "LIGHT_ALARM"
+#define DEVICE_NAME_DEFAULT "LightClock_001"
 
 #define SVC_UUID_16  0xFF10
 #define CHAR_UUID_16 0xFF11
@@ -30,6 +30,8 @@ static bool s_inited;
 static bool s_connected;
 static bool s_adv_started;
 static bool s_want_adv;
+static bool s_adv_data_ready;
+static bool s_adv_config_attempted;
 
 static uint16_t s_gatts_if;
 static uint16_t s_conn_id;
@@ -41,25 +43,65 @@ static esp_attr_value_t s_char_val;
 static uint8_t s_char_val_buf[4] = {'0','7','0','0'};
 
 static uint8_t s_adv_config_done;
-#define ADV_CONFIG_FLAG (1 << 0)
+#define ADV_CONFIG_FLAG      (1 << 0)
+#define SCAN_RSP_CONFIG_FLAG (1 << 1)
 
-static uint8_t s_adv_service_uuid16[2] = { (uint8_t)(SVC_UUID_16 & 0xFF), (uint8_t)(SVC_UUID_16 >> 8) };
+// Raw advertising payload (legacy, <= 31 bytes):
+//  - Flags: 0x06 (LE General Discoverable + BR/EDR not supported)
+//  - Complete list of 16-bit Service UUIDs: 0xFF10
+static const uint8_t s_adv_raw[] = {0x02, 0x01, 0x06, 0x03, 0x03, 0x10, 0xFF};
 
-static esp_ble_adv_data_t s_adv_data = {
-    .set_scan_rsp = false,
-    .include_name = true,
-    .include_txpower = false,
-    .min_interval = 0x20,
-    .max_interval = 0x40,
-    .appearance = 0,
-    .manufacturer_len = 0,
-    .p_manufacturer_data = NULL,
-    .service_data_len = 0,
-    .p_service_data = NULL,
-    .service_uuid_len = sizeof(s_adv_service_uuid16),
-    .p_service_uuid = s_adv_service_uuid16,
-    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
-};
+static void ble_alarm_try_config_adv_payloads(void)
+{
+    if (!s_inited) {
+        return;
+    }
+    if (s_adv_data_ready || s_adv_config_done != 0) {
+        return;
+    }
+    if (s_adv_config_attempted) {
+        return;
+    }
+    s_adv_config_attempted = true;
+
+    esp_err_t err = esp_ble_gap_set_device_name(DEVICE_NAME_DEFAULT);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set dev name failed: %s", esp_err_to_name(err));
+    }
+
+    // Configure raw advertising and scan response payloads.
+    s_adv_data_ready = false;
+    s_adv_config_done = (uint8_t)(ADV_CONFIG_FLAG | SCAN_RSP_CONFIG_FLAG);
+
+    // Build scan response: Complete Local Name (AD type 0x09)
+    // Legacy scan response payload limit is 31 bytes total.
+    size_t name_len = strlen(DEVICE_NAME_DEFAULT);
+    if (name_len > 29) {
+        ESP_LOGW(TAG, "device name too long for scan rsp (%u), truncating", (unsigned)name_len);
+        name_len = 29;
+    }
+    uint8_t scan_rsp_raw[31];
+    scan_rsp_raw[0] = (uint8_t)(1 + name_len); // length of (type + data)
+    scan_rsp_raw[1] = 0x09;                    // Complete Local Name
+    memcpy(&scan_rsp_raw[2], DEVICE_NAME_DEFAULT, name_len);
+    const uint8_t scan_rsp_len = (uint8_t)(2 + name_len);
+
+    ESP_LOGI(TAG, "adv raw len=%u scan_rsp len=%u name_len=%u", (unsigned)sizeof(s_adv_raw), (unsigned)scan_rsp_len,
+             (unsigned)name_len);
+
+    err = esp_ble_gap_config_adv_data_raw((uint8_t *)s_adv_raw, sizeof(s_adv_raw));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "config adv raw failed: %s", esp_err_to_name(err));
+        // Clear flag to avoid indefinite defer loops.
+        s_adv_config_done &= (uint8_t)(~ADV_CONFIG_FLAG);
+    }
+
+    err = esp_ble_gap_config_scan_rsp_data_raw(scan_rsp_raw, scan_rsp_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "config scan rsp raw failed: %s", esp_err_to_name(err));
+        s_adv_config_done &= (uint8_t)(~SCAN_RSP_CONFIG_FLAG);
+    }
+}
 
 static esp_ble_adv_params_t s_adv_params = {
     .adv_int_min = 0x20,
@@ -73,27 +115,40 @@ static esp_ble_adv_params_t s_adv_params = {
 static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
-    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
+    case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
         s_adv_config_done &= (uint8_t)(~ADV_CONFIG_FLAG);
-        if (s_adv_config_done == 0 && s_want_adv && !s_adv_started) {
-            esp_err_t err = esp_ble_gap_start_advertising(&s_adv_params);
-            if (err == ESP_OK) {
-                s_adv_started = true;
-            }
-        }
+        break;
+    case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
+        s_adv_config_done &= (uint8_t)(~SCAN_RSP_CONFIG_FLAG);
         break;
     case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
         if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
             ESP_LOGE(TAG, "adv start failed: %d", param->adv_start_cmpl.status);
+            s_adv_started = false;
         } else {
             ESP_LOGI(TAG, "adv started");
+            s_adv_started = true;
         }
         break;
     case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
         ESP_LOGI(TAG, "adv stopped");
+        s_adv_started = false;
         break;
     default:
         break;
+    }
+
+    // Start advertising once BOTH raw payloads are configured.
+    if (!s_adv_data_ready && s_adv_config_done == 0) {
+        s_adv_data_ready = true;
+        ESP_LOGI(TAG, "adv payloads ready");
+    }
+
+    if (s_adv_config_done == 0 && s_adv_data_ready && s_want_adv && !s_adv_started && !s_connected) {
+        esp_err_t err = esp_ble_gap_start_advertising(&s_adv_params);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ble_gap_start_advertising failed: %s", esp_err_to_name(err));
+        }
     }
 }
 
@@ -103,16 +158,10 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
     case ESP_GATTS_REG_EVT: {
         s_gatts_if = gatts_if;
 
-        esp_err_t err = esp_ble_gap_set_device_name(DEVICE_NAME_DEFAULT);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "set dev name failed: %s", esp_err_to_name(err));
-        }
-
-        err = esp_ble_gap_config_adv_data(&s_adv_data);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "config adv data failed: %s", esp_err_to_name(err));
-        }
-        s_adv_config_done |= ADV_CONFIG_FLAG;
+        // Configure advertising payloads lazily (on first adv request) to avoid any
+        // timing issues during early init.
+        // If ALWAYS_ON calls start immediately, ble_alarm_start_advertising() will trigger it.
+        // Otherwise, first call to ble_alarm_start_advertising() will do it.
 
         esp_gatt_srvc_id_t svc_id = {
             .is_primary = true,
@@ -291,6 +340,8 @@ esp_err_t ble_alarm_init(ble_alarm_on_write_hhmm_t on_write,
     s_adv_config_done = 0;
     s_adv_started = false;
     s_want_adv = false;
+    s_adv_data_ready = false;
+    s_adv_config_attempted = false;
     s_inited = true;
     return ESP_OK;
 }
@@ -306,15 +357,23 @@ esp_err_t ble_alarm_start_advertising(void)
 
     s_want_adv = true;
 
+    // Ensure adv payloads are configured (or at least attempted) before starting.
+    ble_alarm_try_config_adv_payloads();
+
+    // If adv payload isn't configured yet, defer starting until GAP callback.
+    if (!s_adv_data_ready || s_adv_config_done != 0) {
+        ESP_LOGI(TAG, "adv deferred (data_ready=%d cfg_done=0x%02x)", (int)s_adv_data_ready, (unsigned)s_adv_config_done);
+        return ESP_OK;
+    }
+
     if (!s_adv_started) {
-        // If adv data already configured, start immediately; otherwise start in GAP callback.
+        // Adv data is configured; start immediately.
         esp_err_t err = esp_ble_gap_start_advertising(&s_adv_params);
-        if (err == ESP_OK) {
-            s_adv_started = true;
-            return ESP_OK;
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ble_gap_start_advertising failed: %s", esp_err_to_name(err));
+            return err;
         }
-        // In case adv data isn't ready yet.
-        return err;
+        return ESP_OK;
     }
     return ESP_OK;
 }
@@ -332,6 +391,11 @@ esp_err_t ble_alarm_stop_advertising(void)
 bool ble_alarm_is_connected(void)
 {
     return s_connected;
+}
+
+bool ble_alarm_is_advertising(void)
+{
+    return s_adv_started;
 }
 
 esp_err_t ble_alarm_disconnect(void)
@@ -363,6 +427,7 @@ esp_err_t ble_alarm_deinit(void)
     s_inited = false;
     s_connected = false;
     s_adv_started = false;
+    s_adv_data_ready = false;
     s_gatts_if = 0;
     s_conn_id = 0;
     s_service_handle = 0;

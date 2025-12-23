@@ -6,6 +6,27 @@
 
 基础模板：基于ESP-IDF gatt_server 示例 (gatts_demo.c) 进行开发。
 
+说明（2025-12 调试增强/需求更新）：
+1) 常开模式（用于调试）
+- 新增 Kconfig：CONFIG_LIGHT_ALARM_ALWAYS_ON
+- 作用：设备不进入深度睡眠；BLE GAP 广播持续运行，便于手机/PC 蓝牙调试软件随时发现与连接。
+- 现象：串口监视会周期性输出 "ALWAYS_ON tick" 日志。
+
+2) 深度睡眠调试开关
+- Kconfig：CONFIG_LIGHT_ALARM_DEBUG_DISABLE_DEEP_SLEEP
+- 作用：禁用 deep sleep 以避免 ESP32-C3 进入 deep sleep 后导致主机侧 COM 口掉线/监视退出。
+
+3) BLE 设备名与可发现性
+- 设备名：LightClock_001
+- 广播数据策略（按 BLE legacy 广播规范，单包 Advertising Data/Scan Response 各自总长均 <= 31 字节）：
+    - Advertising Data：包含 Flags（通用可发现 + 不支持 BR/EDR）与服务 UUID (0xFF10)
+    - Scan Response：包含 Complete Local Name（设备名），提高部分扫描工具显示名称的兼容性
+
+4) 串口/日志输出（监视稳定性）
+- 建议将主控制台输出切换到 USB Serial/JTAG（而不是 UART0），原因：
+    - 本项目硬件映射把 GPIO20/21 用作 BTN/BAT_ADC_EN，可能与 UART0 默认管脚冲突
+    - 使用 USB Serial/JTAG 可确保日志持续可见
+
 📋 详细需求规格
 一、硬件与引脚配置
 此部分为AI提供精确的硬件控制映射。
@@ -75,6 +96,27 @@ typedef struct {
 } device_config_t;
 ⚠️ 关键注意事项
 深度睡眠与蓝牙：ESP32-C3进入深度睡眠后蓝牙会断开。设计上必须是：配置完成后 -> 断开连接 -> 进入睡眠。在 ESP_GATTS_DISCONNECT_EVT 事件中延迟数秒再睡眠。
+
+可发现性/广播：
+- 设备应在需要配置/调试的窗口内保持可发现（可扫描到）。
+- 常开调试模式（CONFIG_LIGHT_ALARM_ALWAYS_ON=1）下：设备始终保持广播（除非已连接）。
+- 非常开模式下：短按触发显示时间时，唤醒并开启广播一段时间，便于上位机扫描与连接。
+
+调试模式（常开 + 持续广播）：
+
+- CONFIG_LIGHT_ALARM_ALWAYS_ON：设备不进入深度睡眠，BLE GAP 广播持续运行，便于调试软件稳定扫描到设备。
+- CONFIG_LIGHT_ALARM_DEBUG_DISABLE_DEEP_SLEEP：禁用 deep sleep（用于排查 monitor/端口掉线问题）。
+
+BLE 广播规范实现（为提升兼容性）：
+
+- 设备名：LightClock_001
+- Advertising Data（raw，≤31字节）：包含 Flags(0x06) + 16-bit Service UUID 列表(0xFF10)
+- Scan Response（raw，≤31字节）：包含 Complete Local Name=LightClock_001
+
+串口/监视注意：
+
+- 由于本项目硬件映射使用 GPIO20/21 作为 BTN/BAT_ADC_EN，可能与 UART0 默认管脚冲突。
+- 建议将日志控制台切换到 USB Serial/JTAG 以确保 monitor 能稳定看到日志输出。
 
 功耗管理：
 

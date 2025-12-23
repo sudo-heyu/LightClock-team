@@ -92,14 +92,30 @@ static void power_prep_for_sleep(void)
     gpio_set_level(GPIO_I2C_SCL, 0);
 }
 
-static void app_request_sleep_ms(app_ctx_t *app, uint32_t delay_ms)
+static void __attribute__((unused)) app_request_sleep_ms(app_ctx_t *app, uint32_t delay_ms)
 {
+#if CONFIG_LIGHT_ALARM_ALWAYS_ON
+    (void)app;
+    (void)delay_ms;
+    return;
+#else
     app->sleep_requested = true;
     app->sleep_at_us = esp_timer_get_time() + (int64_t)delay_ms * 1000;
+#endif
 }
 
 static void app_enter_deep_sleep(app_ctx_t *app)
 {
+#if CONFIG_LIGHT_ALARM_ALWAYS_ON || CONFIG_LIGHT_ALARM_DEBUG_DISABLE_DEEP_SLEEP
+    ESP_LOGW(TAG, "deep sleep disabled (ALWAYS_ON=%d DEBUG_DISABLE=%d); staying awake for monitor",
+             (int)CONFIG_LIGHT_ALARM_ALWAYS_ON, (int)CONFIG_LIGHT_ALARM_DEBUG_DISABLE_DEEP_SLEEP);
+    power_prep_for_sleep();
+    while (true) {
+        ESP_LOGI(TAG, "alive: BLE connected=%d", (int)ble_alarm_is_connected());
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
+
     timekeeper_init_if_unset();
     time_t now = time(NULL);
 
@@ -181,9 +197,11 @@ static bool ble_on_write(const uint8_t hhmm4[4], void *ctx)
 
     ESP_LOGI(TAG, "alarm updated to %02u%02u", app->cfg.alarm_hour, app->cfg.alarm_minute);
 
+#if !CONFIG_LIGHT_ALARM_ALWAYS_ON
     // After successful write: disconnect then sleep a few seconds later.
     app_request_sleep_ms(app, BLE_IDLE_SLEEP_DELAY_MS);
     (void)ble_alarm_disconnect();
+#endif
 
     return true;
 }
@@ -197,10 +215,16 @@ static void ble_on_read(uint8_t out_hhmm4[4], void *ctx)
 static void ble_on_disconnect(void *ctx)
 {
     app_ctx_t *app = (app_ctx_t *)ctx;
+
+#if CONFIG_LIGHT_ALARM_ALWAYS_ON
+    (void)ble_alarm_start_advertising();
+    app->ble_adv_running = true;
+#else
     if (app->sleep_requested) {
         // ensure we actually wait 3-5 seconds after disconnect
         app_request_sleep_ms(app, BLE_IDLE_SLEEP_DELAY_MS);
     }
+#endif
 }
 
 static void app_ble_ensure_adv(app_ctx_t *app)
@@ -300,8 +324,13 @@ static void app_run_manual_light(app_ctx_t *app)
         }
 
         if (adv_until_us > 0 && esp_timer_get_time() >= adv_until_us && !ble_alarm_is_connected()) {
+    #if !CONFIG_LIGHT_ALARM_ALWAYS_ON
             (void)ble_alarm_stop_advertising();
             adv_until_us = 0;
+    #else
+            // ALWAYS_ON keeps advertising running.
+            adv_until_us = 0;
+    #endif
         }
 
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -314,8 +343,35 @@ static void app_run_manual_light(app_ctx_t *app)
     app_enter_deep_sleep(app);
 }
 
+static void app_run_always_on(app_ctx_t *app)
+{
+    app->state = APP_STATE_ACTIVE_IDLE;
+
+    // Keep peripherals off by default (only BLE advertising for GAP visibility).
+    power_prep_for_sleep();
+
+    app_ble_ensure_adv(app);
+    ESP_LOGI(TAG, "ALWAYS_ON: BLE advertising requested");
+
+    // Give GAP a moment to configure payloads and start advertising.
+    int waited_ms = 0;
+    while (waited_ms < 1500 && !ble_alarm_is_advertising() && !ble_alarm_is_connected()) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        waited_ms += 50;
+    }
+    ESP_LOGI(TAG, "ALWAYS_ON: adv=%d (after %d ms)", (int)ble_alarm_is_advertising(), waited_ms);
+
+    for (;;) {
+        // Periodic log so monitor has continuous output.
+        ESP_LOGI(TAG, "ALWAYS_ON tick: connected=%d adv=%d", (int)ble_alarm_is_connected(), (int)ble_alarm_is_advertising());
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
 void app_main(void)
 {
+    ESP_LOGI(TAG, "boot: ALWAYS_ON=%d", (int)CONFIG_LIGHT_ALARM_ALWAYS_ON);
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -342,6 +398,11 @@ void app_main(void)
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "wakeup cause=%d", cause);
+
+#if CONFIG_LIGHT_ALARM_ALWAYS_ON
+    app_run_always_on(&app);
+    return;
+#endif
 
     if (cause == ESP_SLEEP_WAKEUP_TIMER) {
         app_run_alarm_gradient(&app);

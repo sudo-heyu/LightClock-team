@@ -1,5 +1,22 @@
 menu "Light Wake-up Alarm (BLE)"
 
+    config LIGHT_ALARM_ALWAYS_ON
+        bool "Always on: keep awake + always BLE advertising"
+        default y
+        help
+            When enabled, the firmware will not enter deep sleep and will keep
+            BLE advertising running continuously (GAP advertising).
+            This is intended for debugging and development.
+
+    config LIGHT_ALARM_DEBUG_DISABLE_DEEP_SLEEP
+        bool "Debug: disable deep sleep (keep serial/USB alive)"
+        default y
+        help
+            When enabled, the firmware will not enter deep sleep.
+            This is useful while using idf_monitor on ESP32-C3 where deep sleep
+            can make the COM port disappear on the host.
+            Disable this option for normal low-power behavior.
+
     config LIGHT_ALARM_CH455_INTENSITY
         int "CH455 brightness level (0=max, 7=7/8)"
         range 0 7

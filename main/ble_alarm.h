@@ -26,6 +26,7 @@ esp_err_t ble_alarm_start_advertising(void);
 esp_err_t ble_alarm_stop_advertising(void);
 
 bool ble_alarm_is_connected(void);
+bool ble_alarm_is_advertising(void);
 esp_err_t ble_alarm_disconnect(void);
 
 esp_err_t ble_alarm_deinit(void);
