@@ -93,6 +93,13 @@ static void app_recompute_next_alarm(app_ctx_t *app)
     if (!app) {
         return;
     }
+
+    if (!app->cfg.alarm_enabled) {
+        app->next_alarm_ts = 0;
+        ESP_LOGI(TAG, "alarm disabled: next sunrise start cleared");
+        return;
+    }
+
     time_t now = time(NULL);
     if (!timekeeper_is_time_sane(now)) {
         app->next_alarm_ts = 0;
@@ -158,8 +165,16 @@ static void app_enter_deep_sleep(app_ctx_t *app)
     timekeeper_init_if_unset();
     time_t now = time(NULL);
 
-    int64_t seconds = timekeeper_seconds_until_next_alarm(&app->cfg, now);
-    ESP_LOGI(TAG, "sleeping for %lld seconds until next alarm", (long long)seconds);
+    int64_t seconds = 0;
+    if (app->cfg.alarm_enabled && timekeeper_is_time_sane(now)) {
+        seconds = timekeeper_seconds_until_next_alarm(&app->cfg, now);
+        if (seconds < 0) {
+            seconds = 0;
+        }
+        ESP_LOGI(TAG, "sleeping for %lld seconds until next alarm", (long long)seconds);
+    } else {
+        ESP_LOGI(TAG, "alarm disabled or time not sane: sleeping without timer wakeup");
+    }
 
     // Stop peripherals
     if (app->disp_inited) {
@@ -191,7 +206,9 @@ static void app_enter_deep_sleep(app_ctx_t *app)
 
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 
-    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL));
+    if (seconds > 0) {
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL));
+    }
 
     // Button wakeup: GPIO low level (preferred on ESP32-C3 since GPIO20 is not an RTC IO).
     gpio_pullup_en(GPIO_BTN);
@@ -261,20 +278,24 @@ static void app_apply_light_linear_mix(app_ctx_t *app, uint8_t total_brightness_
     (void)pwm_led_set_percent(&app->pwm, warm_u8, cool_u8);
 }
 
-static bool ble_on_write(const uint8_t hhmm4[4], void *ctx)
+static bool ble_on_write(const uint8_t hhmme5[5], void *ctx)
 {
     app_ctx_t *app = (app_ctx_t *)ctx;
     device_config_t new_cfg;
-    if (!device_config_parse_hhmm_ascii(hhmm4, 4, &new_cfg)) {
+    if (!device_config_parse_hhmme_ascii(hhmme5, 5, &new_cfg)) {
         return false;
     }
 
     // Merge alarm fields only; keep other persisted settings.
     app->cfg.alarm_hour = new_cfg.alarm_hour;
     app->cfg.alarm_minute = new_cfg.alarm_minute;
+    app->cfg.alarm_enabled = new_cfg.alarm_enabled;
     (void)device_config_save(&app->cfg);
 
-    ESP_LOGI(TAG, "alarm updated to %02u%02u", app->cfg.alarm_hour, app->cfg.alarm_minute);
+    ESP_LOGI(TAG, "alarm updated to %02u%02u (enabled=%u)",
+             app->cfg.alarm_hour,
+             app->cfg.alarm_minute,
+             (unsigned)app->cfg.alarm_enabled);
 
     // If we are staying awake (ALWAYS_ON), update next-alarm schedule immediately.
     app_recompute_next_alarm(app);
@@ -375,10 +396,10 @@ static uint8_t ble_on_batt_read(void *ctx)
     return pct;
 }
 
-static void ble_on_read(uint8_t out_hhmm4[4], void *ctx)
+static void ble_on_read(uint8_t out_hhmme5[5], void *ctx)
 {
     app_ctx_t *app = (app_ctx_t *)ctx;
-    device_config_format_hhmm_ascii(&app->cfg, out_hhmm4);
+    device_config_format_hhmme_ascii(&app->cfg, out_hhmme5);
 }
 
 static void ble_on_disconnect(void *ctx)
@@ -631,7 +652,7 @@ static void app_run_always_on(app_ctx_t *app)
         // Alarm trigger while staying awake (ALWAYS_ON). This keeps the PWM wake-up behavior testable
         // without deep sleep.
         time_t now = time(NULL);
-        if (app->next_alarm_ts == 0 && timekeeper_is_time_sane(now)) {
+        if (app->cfg.alarm_enabled && app->next_alarm_ts == 0 && timekeeper_is_time_sane(now)) {
             app_recompute_next_alarm(app);
         }
         if (app->next_alarm_ts != 0 && timekeeper_is_time_sane(now) && now >= app->next_alarm_ts) {

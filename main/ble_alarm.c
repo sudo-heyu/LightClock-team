@@ -29,8 +29,8 @@ static const char *TAG = "BLE";
 // Keep some headroom as we extend characteristics.
 #define NUM_HANDLES  20
 
-static ble_alarm_on_write_hhmm_t s_on_write;
-static ble_alarm_on_read_hhmm_t s_on_read;
+static ble_alarm_on_write_hhmme_t s_on_write;
+static ble_alarm_on_read_hhmme_t s_on_read;
 static ble_alarm_on_write_hhmmss_t s_on_time_sync;
 static ble_alarm_on_read_batt_percent_t s_on_batt_read;
 static ble_alarm_on_write_u8_t s_on_color_temp_write;
@@ -77,7 +77,7 @@ static uint16_t s_sunrise_dur_char_handle;
 static bool s_batt_notify_enabled;
 
 static esp_attr_value_t s_char_val;
-static uint8_t s_char_val_buf[4] = {'0','7','0','0'};
+static uint8_t s_char_val_buf[5] = {'0','7','0','0','1'};
 
 static uint16_t s_cccd_val = 0x0000;
 
@@ -215,6 +215,62 @@ static bool try_normalize_write_to_hhmm4(const uint8_t *data, uint16_t len, uint
     }
 
     return false;
+}
+
+static bool try_normalize_write_to_hhmme5(const uint8_t *data, uint16_t len, uint8_t out_hhmme5[5])
+{
+    if (!data || !out_hhmme5 || len == 0) {
+        return false;
+    }
+
+    // 1) Preferred: exactly 5 ASCII digits "HHMME" where E is 0/1.
+    if (len == 5) {
+        if (is_ascii_digit(data[0]) && is_ascii_digit(data[1]) && is_ascii_digit(data[2]) && is_ascii_digit(data[3]) &&
+            (data[4] == '0' || data[4] == '1')) {
+            memcpy(out_hhmme5, data, 5);
+            return true;
+        }
+    }
+
+    // 2) Backward-compatible: accept HHMM (enable defaults to 1)
+    {
+        uint8_t hhmm4[4] = {0};
+        if (try_normalize_write_to_hhmm4(data, len, hhmm4)) {
+            memcpy(out_hhmme5, hhmm4, 4);
+            out_hhmme5[4] = '1';
+            return true;
+        }
+    }
+
+    // 3) Robust: trim and collect digits; use first 4 digits as HHMM and optional 5th as E.
+    uint16_t start = 0;
+    uint16_t end = len;
+    while (start < end && (data[start] == 0 || data[start] == ' ' || data[start] == '\r' || data[start] == '\n' || data[start] == '\t')) {
+        start++;
+    }
+    while (end > start && (data[end - 1] == 0 || data[end - 1] == ' ' || data[end - 1] == '\r' || data[end - 1] == '\n' || data[end - 1] == '\t')) {
+        end--;
+    }
+    if (end <= start) {
+        return false;
+    }
+
+    uint8_t digits[5] = {0};
+    int n = 0;
+    for (uint16_t i = start; i < end && n < 5; i++) {
+        if (is_ascii_digit(data[i])) {
+            digits[n++] = data[i];
+        }
+    }
+    if (n < 4) {
+        return false;
+    }
+    memcpy(out_hhmme5, digits, 4);
+    out_hhmme5[4] = (n >= 5) ? digits[4] : (uint8_t)'1';
+    if (out_hhmme5[4] != '0' && out_hhmme5[4] != '1') {
+        out_hhmme5[4] = '1';
+    }
+    return true;
 }
 
 // Raw advertising payload (legacy, <= 31 bytes):
@@ -517,14 +573,14 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
         rsp.attr_value.handle = param->read.handle;
 
         if (param->read.handle == s_alarm_char_handle) {
-            uint8_t hhmm[4] = {0};
+            uint8_t hhmme[5] = {0};
             if (s_on_read) {
-                s_on_read(hhmm, s_ctx);
+                s_on_read(hhmme, s_ctx);
             } else {
-                memcpy(hhmm, s_char_val_buf, sizeof(hhmm));
+                memcpy(hhmme, s_char_val_buf, sizeof(hhmme));
             }
-            memcpy(rsp.attr_value.value, hhmm, sizeof(hhmm));
-            rsp.attr_value.len = sizeof(hhmm);
+            memcpy(rsp.attr_value.value, hhmme, sizeof(hhmme));
+            rsp.attr_value.len = sizeof(hhmme);
             esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
         } else if (param->read.handle == s_batt_char_handle) {
             uint8_t pct = 0;
@@ -637,18 +693,18 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
         esp_gatt_status_t st = ESP_GATT_OK;
         bool accepted = false;
 
-        uint8_t hhmm4[4] = {0};
-        bool normalized = try_normalize_write_to_hhmm4(param->write.value, param->write.len, hhmm4);
+        uint8_t hhmme5[5] = {0};
+        bool normalized = try_normalize_write_to_hhmme5(param->write.value, param->write.len, hhmme5);
         if (normalized && s_on_write) {
-            ESP_LOGI(TAG, "write normalized to HHMM='%c%c%c%c'", hhmm4[0], hhmm4[1], hhmm4[2], hhmm4[3]);
-            accepted = s_on_write(hhmm4, s_ctx);
+            ESP_LOGI(TAG, "write normalized to HHMME='%c%c%c%c%c'", hhmme5[0], hhmme5[1], hhmme5[2], hhmme5[3], hhmme5[4]);
+            accepted = s_on_write(hhmme5, s_ctx);
         } else {
             ESP_LOGW(TAG, "write rejected: normalized=%d on_write=%d", (int)normalized, (int)(s_on_write != NULL));
         }
         if (!accepted) {
             st = ESP_GATT_INVALID_ATTR_LEN;
         } else {
-            memcpy(s_char_val_buf, hhmm4, 4);
+            memcpy(s_char_val_buf, hhmme5, 5);
         }
 
         if (param->write.need_rsp) {
@@ -662,8 +718,8 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
     }
 }
 
-esp_err_t ble_alarm_init(ble_alarm_on_write_hhmm_t on_write,
-                         ble_alarm_on_read_hhmm_t on_read,
+esp_err_t ble_alarm_init(ble_alarm_on_write_hhmme_t on_write,
+                         ble_alarm_on_read_hhmme_t on_read,
                          ble_alarm_on_write_hhmmss_t on_time_sync,
                          ble_alarm_on_read_batt_percent_t on_batt_read,
                          ble_alarm_on_write_u8_t on_write_color_temp,

@@ -13,16 +13,16 @@ extern "C" {
 typedef void (*ble_alarm_on_connect_t)(void *ctx);
 typedef void (*ble_alarm_on_disconnect_t)(void *ctx);
 
-typedef bool (*ble_alarm_on_write_hhmm_t)(const uint8_t hhmm4[4], void *ctx);
-typedef void (*ble_alarm_on_read_hhmm_t)(uint8_t out_hhmm4[4], void *ctx);
+typedef bool (*ble_alarm_on_write_hhmme_t)(const uint8_t hhmme5[5], void *ctx);
+typedef void (*ble_alarm_on_read_hhmme_t)(uint8_t out_hhmme5[5], void *ctx);
 
 typedef bool (*ble_alarm_on_write_hhmmss_t)(const uint8_t hhmmss6[6], void *ctx);
 typedef uint8_t (*ble_alarm_on_read_batt_percent_t)(void *ctx);
 
 typedef bool (*ble_alarm_on_write_u8_t)(uint8_t value_0_100, void *ctx);
 
-esp_err_t ble_alarm_init(ble_alarm_on_write_hhmm_t on_write,
-                         ble_alarm_on_read_hhmm_t on_read,
+esp_err_t ble_alarm_init(ble_alarm_on_write_hhmme_t on_write,
+                         ble_alarm_on_read_hhmme_t on_read,
                          ble_alarm_on_write_hhmmss_t on_time_sync,
                          ble_alarm_on_read_batt_percent_t on_batt_read,
                          ble_alarm_on_write_u8_t on_write_color_temp,
