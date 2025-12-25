@@ -14,6 +14,7 @@ typedef struct {
     bool inited;
     gpio_num_t adc_gpio;
     gpio_num_t en_gpio;
+    bool en_active_high;
 
     // ADC
     void *unit; // adc_oneshot_unit_handle_t (opaque here to keep header light)
@@ -33,6 +34,9 @@ esp_err_t battery_read_mv(battery_t *bat, uint32_t *out_mv);
 
 // Reads battery percent (0..100). Uses a simple voltage->percent mapping.
 esp_err_t battery_read_percent(battery_t *bat, uint8_t *out_percent);
+
+// Converts a measured battery voltage (mV) to percent (0..100) using current mapping.
+uint8_t battery_mv_to_percent(uint32_t mv);
 
 // Deinitializes ADC resources.
 void battery_deinit(battery_t *bat);

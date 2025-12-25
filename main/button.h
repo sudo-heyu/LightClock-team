@@ -24,6 +24,7 @@ typedef struct {
     // internal
     bool last_pressed;
     int64_t press_start_us;
+    bool long_reported;
 } button_t;
 
 esp_err_t button_init(button_t *btn, gpio_num_t gpio, bool active_low, uint32_t long_press_ms);

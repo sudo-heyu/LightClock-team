@@ -22,7 +22,7 @@ static bool cfg_valid(const device_config_t *cfg)
         return false;
     }
         return (cfg->alarm_hour < 24) && (cfg->alarm_minute < 60) && (cfg->alarm_enabled <= 1) && (cfg->color_temp <= 100) &&
-            (cfg->wake_bright <= 100) && (cfg->sunrise_duration >= 5) && (cfg->sunrise_duration <= 60);
+            (cfg->wake_bright <= 100) && (cfg->sunrise_duration >= 1) && (cfg->sunrise_duration <= 60);
 }
 
 static device_config_t cfg_default(void)

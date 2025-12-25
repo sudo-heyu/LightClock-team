@@ -25,7 +25,16 @@ menu "Light Wake-up Alarm (BLE)"
     config LIGHT_ALARM_TIME_SHOW_SECONDS
         int "Short-press time display duration (seconds)"
         range 5 120
-        default 20
+        default 10
+
+    config LIGHT_ALARM_DEBUG_BAT_ADC_EN_ALWAYS_HIGH
+        bool "Debug: keep BAT_ADC_EN high"
+        default n
+        help
+            When enabled, BAT_ADC_EN (GPIO21) is kept at high level all the time.
+            This is useful for debugging battery voltage measurement on boards
+            where the divider is gated by BAT_ADC_EN.
+            When disabled, BAT_ADC_EN is only asserted during sampling.
 
     config LIGHT_ALARM_GRADIENT_MINUTES
         int "Alarm sunrise gradient duration (minutes)"

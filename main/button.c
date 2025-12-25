@@ -21,6 +21,7 @@ esp_err_t button_init(button_t *btn, gpio_num_t gpio, bool active_low, uint32_t 
     btn->long_press_ms = long_press_ms;
     btn->last_pressed = false;
     btn->press_start_us = 0;
+    btn->long_reported = false;
 
     gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << gpio),
@@ -67,15 +68,26 @@ button_event_t button_poll(button_t *btn)
     if (pressed && !btn->last_pressed) {
         btn->press_start_us = now_us;
         btn->last_pressed = true;
+        btn->long_reported = false;
         return BUTTON_EVENT_NONE;
+    }
+
+    // While still pressed, emit LONG once when the threshold is reached.
+    if (pressed && btn->last_pressed && !btn->long_reported) {
+        uint32_t dur_ms = (uint32_t)((now_us - btn->press_start_us) / 1000);
+        if (dur_ms >= btn->long_press_ms) {
+            btn->long_reported = true;
+            return BUTTON_EVENT_LONG;
+        }
     }
 
     if (!pressed && btn->last_pressed) {
         uint32_t dur_ms = (uint32_t)((now_us - btn->press_start_us) / 1000);
         btn->last_pressed = false;
         btn->press_start_us = 0;
-        if (dur_ms >= btn->long_press_ms) {
-            return BUTTON_EVENT_LONG;
+        if (btn->long_reported || dur_ms >= btn->long_press_ms) {
+            btn->long_reported = false;
+            return BUTTON_EVENT_NONE;
         }
         return BUTTON_EVENT_SHORT;
     }

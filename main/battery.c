@@ -7,17 +7,31 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+
+#include "sdkconfig.h"
 
 static const char *TAG = "BATT";
 
-// Divider ratio per requirement.md: 15.1k / 5.1k
-// Vbat = Vadc * (Rtop + Rbot) / Rbot
-#define BATT_DIV_NUMERATOR_MOHM   (15100 + 5100)
+// Actual hardware divider (schematic): Rtop=10k (R18) in series, Rbot=5.1k (R19)
+// Vbat = Vadc * (Rtop + Rbot) / Rbot = Vadc * 15100 / 5100 ≈ 2.96x
+#define BATT_DIV_NUMERATOR_MOHM   (10000 + 5100)
 #define BATT_DIV_DENOMINATOR_MOHM (5100)
 
-// Simple Li-ion mapping (can be tuned later)
-#define BATT_EMPTY_MV (3300)
-#define BATT_FULL_MV  (4200)
+// New requirement (2S pack):
+//  - ~7.0V => 0%
+//  - ~8.4V => 100%
+// Clamp outside the range.
+#define BATT_EMPTY_MV (7000)
+#define BATT_FULL_MV  (8400)
+
+// Fallback conversion constants when ADC calibration is unavailable.
+// SAR ADC (12-bit): Vdata = Vref * data / 4095
+// ESP32-C3 default Vref is ~1100mV (factory). With 11dB attenuation, measurable range ~3.55V.
+// Use a simple rational approximation for 11dB scaling: 355/110 ≈ 3.227, but we keep headroom and use 3.2.
+#define ADC_FALLBACK_VREF_MV (1100)
+#define ADC_FALLBACK_ATTEN_DB11_NUM (32)
+#define ADC_FALLBACK_ATTEN_DB11_DEN (10)
 
 static uint32_t scale_divider_to_battery_mv(uint32_t vadc_mv)
 {
@@ -38,6 +52,26 @@ static uint8_t mv_to_percent(uint32_t mv)
     return (uint8_t)(((mv - BATT_EMPTY_MV) * 100U) / (BATT_FULL_MV - BATT_EMPTY_MV));
 }
 
+uint8_t battery_mv_to_percent(uint32_t mv)
+{
+    return mv_to_percent(mv);
+}
+
+static int battery_read_raw_avg(adc_oneshot_unit_handle_t unit, adc_channel_t channel)
+{
+    int raw_sum = 0;
+    const int samples = 8;
+    for (int i = 0; i < samples; i++) {
+        int raw = 0;
+        if (adc_oneshot_read(unit, channel, &raw) != ESP_OK) {
+            return -1;
+        }
+        raw_sum += raw;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return raw_sum / samples;
+}
+
 esp_err_t battery_init(battery_t *bat, gpio_num_t adc_gpio, gpio_num_t en_gpio)
 {
     if (!bat) {
@@ -47,6 +81,7 @@ esp_err_t battery_init(battery_t *bat, gpio_num_t adc_gpio, gpio_num_t en_gpio)
     *bat = (battery_t){0};
     bat->adc_gpio = adc_gpio;
     bat->en_gpio = en_gpio;
+    bat->en_active_high = true;
 
     gpio_config_t en = {
         .pin_bit_mask = (1ULL << en_gpio),
@@ -81,6 +116,7 @@ esp_err_t battery_init(battery_t *bat, gpio_num_t adc_gpio, gpio_num_t en_gpio)
     }
 
     adc_oneshot_chan_cfg_t chan_cfg = {
+        // Use 11dB attenuation to avoid saturation near 2.0V ADC input (≈8.4V battery after divider).
         .atten = ADC_ATTEN_DB_11,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
@@ -126,7 +162,61 @@ esp_err_t battery_init(battery_t *bat, gpio_num_t adc_gpio, gpio_num_t en_gpio)
     bat->cali_enabled = cali_ok;
     bat->inited = true;
 
-    ESP_LOGI(TAG, "battery init: gpio_adc=%d unit=%d chan=%d cali=%d", (int)adc_gpio, (int)unit_id, (int)channel, (int)cali_ok);
+#if CONFIG_LIGHT_ALARM_DEBUG_BAT_ADC_EN_ALWAYS_HIGH
+    // Debug mode: keep BAT_ADC_EN high all the time as requested.
+    // In this mode we assume active-high gating and do not auto-detect polarity.
+    bat->en_active_high = true;
+    gpio_set_level(bat->en_gpio, 1);
+    ESP_LOGW(TAG, "DEBUG: BAT_ADC_EN forced HIGH permanently");
+    ESP_LOGI(TAG, "battery init: gpio_adc=%d unit=%d chan=%d cali=%d en_active_high=%d",
+             (int)adc_gpio,
+             (int)unit_id,
+             (int)channel,
+             (int)cali_ok,
+             (int)bat->en_active_high);
+    return ESP_OK;
+#endif
+
+    // Auto-detect BAT_ADC_EN polarity (some boards wire the enable transistor inverted).
+    // We assume the enabled state produces a significantly higher ADC reading than the disabled state.
+    {
+        adc_oneshot_unit_handle_t u = (adc_oneshot_unit_handle_t)bat->unit;
+        adc_channel_t ch = (adc_channel_t)bat->channel;
+
+        gpio_set_level(bat->en_gpio, 1);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        int raw_high = battery_read_raw_avg(u, ch);
+
+        gpio_set_level(bat->en_gpio, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        int raw_low = battery_read_raw_avg(u, ch);
+
+        // Return to "disabled" by default (active level decided below).
+        const int margin = 50;
+        if (raw_high >= 0 && raw_low >= 0) {
+            if (raw_high > raw_low + margin) {
+                bat->en_active_high = true;
+            } else if (raw_low > raw_high + margin) {
+                bat->en_active_high = false;
+            } else {
+                // Ambiguous; keep default and warn.
+                bat->en_active_high = true;
+                ESP_LOGW(TAG, "BAT_ADC_EN polarity ambiguous (raw_high=%d raw_low=%d); default active-high", raw_high, raw_low);
+            }
+        }
+
+        ESP_LOGI(TAG, "battery init: gpio_adc=%d unit=%d chan=%d cali=%d en_active_high=%d raw_high=%d raw_low=%d",
+                 (int)adc_gpio,
+                 (int)unit_id,
+                 (int)channel,
+                 (int)cali_ok,
+                 (int)bat->en_active_high,
+                 raw_high,
+                 raw_low);
+
+        // Ensure sampling path is disabled when idle.
+        gpio_set_level(bat->en_gpio, bat->en_active_high ? 0 : 1);
+    }
     return ESP_OK;
 }
 
@@ -136,29 +226,26 @@ esp_err_t battery_read_mv(battery_t *bat, uint32_t *out_mv)
         return ESP_ERR_INVALID_ARG;
     }
 
-    gpio_set_level(bat->en_gpio, 1);
-    vTaskDelay(pdMS_TO_TICKS(5));
+#if CONFIG_LIGHT_ALARM_DEBUG_BAT_ADC_EN_ALWAYS_HIGH
+    int enable_level = 1;
+    int disable_level = 1; // keep high after read
+#else
+    int enable_level = bat->en_active_high ? 1 : 0;
+    int disable_level = bat->en_active_high ? 0 : 1;
+#endif
+
+    gpio_set_level(bat->en_gpio, enable_level);
+    // Requirement.md suggests >=10ms settle time after enabling BAT_ADC_EN.
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     adc_oneshot_unit_handle_t unit = (adc_oneshot_unit_handle_t)bat->unit;
     adc_channel_t channel = (adc_channel_t)bat->channel;
 
-    // Average a few samples to reduce noise.
-    int raw_sum = 0;
-    const int samples = 8;
-    for (int i = 0; i < samples; i++) {
-        int raw = 0;
-        esp_err_t err = adc_oneshot_read(unit, channel, &raw);
-        if (err != ESP_OK) {
-            gpio_set_level(bat->en_gpio, 0);
-            return err;
-        }
-        raw_sum += raw;
-        vTaskDelay(pdMS_TO_TICKS(2));
+    int raw_avg = battery_read_raw_avg(unit, channel);
+    gpio_set_level(bat->en_gpio, disable_level);
+    if (raw_avg < 0) {
+        return ESP_FAIL;
     }
-
-    gpio_set_level(bat->en_gpio, 0);
-
-    int raw_avg = raw_sum / samples;
 
     uint32_t vadc_mv = 0;
     if (bat->cali_enabled && bat->cali) {
@@ -172,11 +259,19 @@ esp_err_t battery_read_mv(battery_t *bat, uint32_t *out_mv)
     if (vadc_mv == 0) {
         // Fallback rough conversion when calibration is not available.
         // For 12-bit default, raw range is 0..4095.
-        vadc_mv = (uint32_t)((uint64_t)raw_avg * 3300ULL / 4095ULL);
+        uint64_t mv = (uint64_t)raw_avg * (uint64_t)ADC_FALLBACK_VREF_MV;
+        mv = (mv + 2047ULL) / 4095ULL;
+        // Apply attenuation scaling (11dB ~3.2x in this approximation).
+        mv = (mv * (uint64_t)ADC_FALLBACK_ATTEN_DB11_NUM + (ADC_FALLBACK_ATTEN_DB11_DEN / 2)) / (uint64_t)ADC_FALLBACK_ATTEN_DB11_DEN;
+        vadc_mv = (uint32_t)mv;
     }
 
     uint32_t vbat_mv = scale_divider_to_battery_mv(vadc_mv);
     *out_mv = vbat_mv;
+
+    // Helpful for diagnosing saturation / wiring / divider issues.
+    // Bump to INFO so it is visible without raising global log level.
+    ESP_LOGI(TAG, "adc raw_avg=%d vadc_mv=%u vbat_mv=%u", raw_avg, (unsigned)vadc_mv, (unsigned)vbat_mv);
     return ESP_OK;
 }
 
@@ -192,7 +287,25 @@ esp_err_t battery_read_percent(battery_t *bat, uint8_t *out_percent)
         return err;
     }
 
-    *out_percent = mv_to_percent(mv);
+    uint8_t pct = mv_to_percent(mv);
+    *out_percent = pct;
+
+    // Rate-limited info log: prints measured battery voltage and mapped percent.
+    static int64_t s_last_info_us;
+    int64_t now_us = esp_timer_get_time();
+    if (now_us - s_last_info_us >= 5LL * 1000000LL) {
+        s_last_info_us = now_us;
+        ESP_LOGI(TAG, "battery: %u mV (%.2f V) -> %u%% (map %u..%u mV)",
+                 (unsigned)mv,
+                 (double)mv / 1000.0,
+                 (unsigned)pct,
+                 (unsigned)BATT_EMPTY_MV,
+                 (unsigned)BATT_FULL_MV);
+    }
+
+    if (mv < 1000) {
+        ESP_LOGW(TAG, "battery voltage too low (%u mV); check BAT_ADC/BAT_ADC_EN wiring and divider", (unsigned)mv);
+    }
     return ESP_OK;
 }
 

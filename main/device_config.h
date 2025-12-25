@@ -16,7 +16,7 @@ typedef struct {
     uint8_t alarm_enabled; // 0/1
     uint8_t color_temp;   // 0-100 (0=cool, 100=warm)
     uint8_t wake_bright;  // 0-100 (max brightness target for alarm gradient)
-    uint8_t sunrise_duration; // 5-60 minutes (sunrise simulation duration)
+    uint8_t sunrise_duration; // 1-60 minutes (sunrise simulation duration)
 } device_config_t;
 
 #define DEVICE_CONFIG_DEFAULT_HOUR   (7)

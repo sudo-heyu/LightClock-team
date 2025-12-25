@@ -84,9 +84,9 @@ int64_t timekeeper_seconds_until_next_alarm(const device_config_t *cfg, time_t n
     }
 
     uint8_t sunrise_min = cfg->sunrise_duration;
-    if (sunrise_min < 5 || sunrise_min > 60) {
+    if (sunrise_min < 1 || sunrise_min > 60) {
         sunrise_min = DEVICE_CONFIG_DEFAULT_SUNRISE_DURATION_MINUTES;
-        if (sunrise_min < 5) sunrise_min = 5;
+        if (sunrise_min < 1) sunrise_min = 1;
         if (sunrise_min > 60) sunrise_min = 60;
     }
 

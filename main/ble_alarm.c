@@ -542,6 +542,9 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
 
     case ESP_GATTS_CONNECT_EVT:
         s_connected = true;
+        // Most stacks automatically stop advertising upon a successful connection,
+        // but do not always emit ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT. Keep our state consistent.
+        s_adv_started = false;
         s_conn_id = param->connect.conn_id;
         memcpy(s_remote_bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
         ESP_LOGI(TAG, "connected");
@@ -552,6 +555,8 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
 
     case ESP_GATTS_DISCONNECT_EVT:
         s_connected = false;
+        // Ensure we allow immediate restart; advertising likely stopped while connected.
+        s_adv_started = false;
         s_conn_id = 0;
         memset(s_remote_bda, 0, sizeof(s_remote_bda));
         ESP_LOGI(TAG, "disconnected reason=0x%02x", param->disconnect.reason);
@@ -560,7 +565,7 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
         }
         // Self-heal: if app wants advertising, restart after disconnect.
         if (s_want_adv) {
-            ble_alarm_schedule_adv_retry_ms(200);
+            ble_alarm_schedule_adv_retry_ms(50);
         }
         break;
 
@@ -611,6 +616,13 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
                 s_cccd_val = v;
                 s_batt_notify_enabled = ((v & 0x0001) != 0);
                 ESP_LOGI(TAG, "batt notify %s", s_batt_notify_enabled ? "EN" : "DIS");
+
+                // Requirement: after a successful connection, provide battery to the client.
+                // Typical BLE flow enables CCCD right after connect; send once immediately.
+                if (s_batt_notify_enabled && s_on_batt_read) {
+                    uint8_t pct = s_on_batt_read(s_ctx);
+                    (void)ble_alarm_notify_battery(pct);
+                }
             } else {
                 st = ESP_GATT_INVALID_ATTR_LEN;
             }
@@ -663,7 +675,7 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
                         }
                     }
                 } else if (param->write.handle == s_sunrise_dur_char_handle) {
-                    if (v >= 5 && v <= 60) {
+                    if (v >= 1 && v <= 60) {
                         ESP_LOGI(TAG, "sunrise dur write=%u min", (unsigned)v);
                         if (s_on_sunrise_dur_write) {
                             accepted = s_on_sunrise_dur_write(v, s_ctx);
@@ -831,15 +843,17 @@ esp_err_t ble_alarm_start_advertising(void)
         return ESP_OK;
     }
 
-    if (!s_adv_started) {
-        // Adv data is configured; start immediately.
-        esp_err_t err = esp_ble_gap_start_advertising(&s_adv_params);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_ble_gap_start_advertising failed: %s", esp_err_to_name(err));
-            ble_alarm_schedule_adv_retry_ms(800);
-            return err;
+    // Adv data is configured; attempt to start immediately.
+    // Note: some controller/stack versions may return INVALID_STATE if advertising is already active;
+    // treat that as benign and keep the self-heal timer alive.
+    esp_err_t err = esp_ble_gap_start_advertising(&s_adv_params);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_INVALID_STATE) {
+            return ESP_OK;
         }
-        return ESP_OK;
+        ESP_LOGE(TAG, "esp_ble_gap_start_advertising failed: %s", esp_err_to_name(err));
+        ble_alarm_schedule_adv_retry_ms(800);
+        return err;
     }
     return ESP_OK;
 }
@@ -938,14 +952,16 @@ static void ble_alarm_adv_retry_cb(void *arg)
 
     // Ensure payload is configured (first time) and retry advertising start.
     ble_alarm_try_config_adv_payloads();
-    if (!s_adv_started && s_adv_data_ready && s_adv_config_done == 0) {
+    if (s_adv_data_ready && s_adv_config_done == 0) {
         esp_err_t err = esp_ble_gap_start_advertising(&s_adv_params);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "adv retry start failed: %s", esp_err_to_name(err));
-            ble_alarm_schedule_adv_retry_ms(1200);
+            if (err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "adv retry start failed: %s", esp_err_to_name(err));
+                ble_alarm_schedule_adv_retry_ms(1200);
+                return;
+            }
         }
-    } else {
-        // Keep the self-heal alive.
-        ble_alarm_schedule_adv_retry_ms(2000);
     }
+    // Keep the self-heal alive.
+    ble_alarm_schedule_adv_retry_ms(2000);
 }
