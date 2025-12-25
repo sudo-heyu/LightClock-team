@@ -1,6 +1,9 @@
 #include "pwm_led.h"
 
 #include "driver/ledc.h"
+#include "esp_log.h"
+
+static const char *TAG = "PWM";
 
 static uint32_t percent_to_duty(uint8_t percent, uint32_t duty_max)
 {
@@ -18,6 +21,7 @@ esp_err_t pwm_led_init(pwm_led_t *led, gpio_num_t warm_gpio, gpio_num_t cool_gpi
 
     led->warm_gpio = warm_gpio;
     led->cool_gpio = cool_gpio;
+    // Requirement: >20kHz. Use 24kHz.
     led->freq_hz = 24000;
 
     ledc_timer_config_t timer = {
@@ -29,6 +33,7 @@ esp_err_t pwm_led_init(pwm_led_t *led, gpio_num_t warm_gpio, gpio_num_t cool_gpi
     };
     esp_err_t err = ledc_timer_config(&timer);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "timer config failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -45,6 +50,7 @@ esp_err_t pwm_led_init(pwm_led_t *led, gpio_num_t warm_gpio, gpio_num_t cool_gpi
     };
     err = ledc_channel_config(&ch0);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "warm channel config failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -54,10 +60,12 @@ esp_err_t pwm_led_init(pwm_led_t *led, gpio_num_t warm_gpio, gpio_num_t cool_gpi
     ch1.duty = 0;
     err = ledc_channel_config(&ch1);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cool channel config failed: %s", esp_err_to_name(err));
         return err;
     }
 
     led->inited = true;
+    ESP_LOGI(TAG, "init ok: warm_gpio=%d cool_gpio=%d freq=%luHz duty_max=%lu", (int)warm_gpio, (int)cool_gpio, (unsigned long)led->freq_hz, (unsigned long)led->duty_max);
     return ESP_OK;
 }
 
@@ -71,13 +79,29 @@ esp_err_t pwm_led_set_percent(pwm_led_t *led, uint8_t warm_percent, uint8_t cool
     uint32_t cool_duty = percent_to_duty(cool_percent, led->duty_max);
 
     esp_err_t err = ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, warm_duty);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set duty warm failed: %s", esp_err_to_name(err));
+        return err;
+    }
     err = ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "update duty warm failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
     err = ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, cool_duty);
-    if (err != ESP_OK) return err;
-    return ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set duty cool failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "update duty cool failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "set percent warm=%u%% cool=%u%% duty=(%lu,%lu)", (unsigned)warm_percent, (unsigned)cool_percent, (unsigned long)warm_duty, (unsigned long)cool_duty);
+    return ESP_OK;
 }
 
 esp_err_t pwm_led_off(pwm_led_t *led)

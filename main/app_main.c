@@ -260,8 +260,26 @@ static void app_periph_ensure_display(app_ctx_t *app)
 static void app_periph_ensure_pwm(app_ctx_t *app)
 {
     if (!app->pwm_inited) {
-        ESP_ERROR_CHECK(pwm_led_init(&app->pwm, GPIO_PWM_WARM, GPIO_PWM_COOL));
-        app->pwm_inited = true;
+        esp_err_t err = pwm_led_init(&app->pwm, GPIO_PWM_WARM, GPIO_PWM_COOL);
+        if (err == ESP_OK) {
+            app->pwm_inited = true;
+            ESP_LOGI(TAG, "pwm init ok (warm=%d cool=%d)", (int)GPIO_PWM_WARM, (int)GPIO_PWM_COOL);
+
+            // Self-test: briefly light warm-only then cool-only for diagnosis.
+            // Warm 100% / Cool 0%
+            (void)pwm_led_set_percent(&app->pwm, 100, 0);
+            ESP_LOGI(TAG, "pwm selftest: warm=100%% cool=0%% (expect warm LED on)");
+            vTaskDelay(pdMS_TO_TICKS(200));
+            (void)pwm_led_set_percent(&app->pwm, 0, 0);
+
+            // Cool 100% / Warm 0%
+            (void)pwm_led_set_percent(&app->pwm, 0, 100);
+            ESP_LOGI(TAG, "pwm selftest: warm=0%% cool=100%% (expect cool LED on)");
+            vTaskDelay(pdMS_TO_TICKS(200));
+            (void)pwm_led_set_percent(&app->pwm, 0, 0);
+        } else {
+            ESP_LOGE(TAG, "pwm init failed: %s", esp_err_to_name(err));
+        }
     }
 }
 
@@ -286,11 +304,33 @@ static void app_apply_light_linear_mix(app_ctx_t *app, uint8_t total_brightness_
     if (warm > total_brightness_0_100) {
         warm = total_brightness_0_100;
     }
+
+    // Avoid both channels going to 0 when brightness is very low.
+    // If there is a non-zero brightness budget but rounding zeroed one side, force 1% to that side.
+    uint16_t cool = (uint16_t)total_brightness_0_100 - warm;
+    if (total_brightness_0_100 > 0 && color_temp_0_100 > 0 && warm == 0) {
+        warm = 1;
+        if (cool > 0) {
+            cool -= 1;
+        }
+    }
+    if (total_brightness_0_100 > 0 && color_temp_0_100 < 100 && cool == 0) {
+        cool = 1;
+        if (warm > 0) {
+            warm -= 1;
+        }
+    }
+
     uint8_t warm_u8 = (uint8_t)warm;
-    uint8_t cool_u8 = (uint8_t)(total_brightness_0_100 - warm_u8);
+    uint8_t cool_u8 = (uint8_t)cool;
 
     app_periph_ensure_pwm(app);
-    (void)pwm_led_set_percent(&app->pwm, warm_u8, cool_u8);
+    esp_err_t err = pwm_led_set_percent(&app->pwm, warm_u8, cool_u8);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "light mix: total=%u%% ct=%u%% -> warm=%u%% cool=%u%%", (unsigned)total_brightness_0_100, (unsigned)color_temp_0_100, (unsigned)warm_u8, (unsigned)cool_u8);
+    } else {
+        ESP_LOGE(TAG, "light mix set failed: %s", esp_err_to_name(err));
+    }
 }
 
 static bool ble_on_write(const uint8_t hhmme5[5], void *ctx)
@@ -659,6 +699,7 @@ static void app_run_always_on(app_ctx_t *app)
             app_run_show_time(app, TIME_SHOW_MS);
         } else if (ev == BUTTON_EVENT_LONG) {
             ESP_LOGI(TAG, "ALWAYS_ON: long press -> manual light toggle");
+            // Debounce long vs short: once we enter manual, we stay until long press inside manual exits.
             app_run_manual_light(app);
         }
 
