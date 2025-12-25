@@ -34,7 +34,7 @@ static const char *TAG = "APP";
 #define GPIO_BAT_ADC_EN   GPIO_NUM_21
 
 // Behavior constants
-#define LONG_PRESS_MS            2000
+#define LONG_PRESS_MS            1000
 #define TIME_SHOW_MS             (CONFIG_LIGHT_ALARM_TIME_SHOW_SECONDS * 1000)
 #define DEFAULT_SUNRISE_MINUTES_FALLBACK (CONFIG_LIGHT_ALARM_GRADIENT_MINUTES)
 #define BLE_IDLE_SLEEP_DELAY_MS  3000
@@ -49,6 +49,9 @@ typedef enum {
 typedef struct {
     device_config_t cfg;
     app_state_t state;
+
+    TaskHandle_t main_task;
+    volatile bool light_update_pending;
 
     ch455g_t disp;
     bool disp_inited;
@@ -72,6 +75,26 @@ typedef struct {
 } app_ctx_t;
 
 #define GPIO_BAT_ADC      GPIO_NUM_3
+
+// Forward declarations (used across mode handlers)
+static void app_run_manual_light(app_ctx_t *app);
+
+static inline void app_request_light_update(app_ctx_t *app)
+{
+    if (!app) {
+        return;
+    }
+    app->light_update_pending = true;
+    if (app->main_task) {
+        xTaskNotifyGive(app->main_task);
+    }
+}
+
+static inline void app_wait_ms_or_light_update(uint32_t ms)
+{
+    // Sleep, but allow BLE writes to wake us up early for quicker light updates.
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ms));
+}
 
 static void batt_notify_timer_cb(void *arg)
 {
@@ -325,9 +348,20 @@ static void app_apply_light_linear_mix(app_ctx_t *app, uint8_t total_brightness_
     uint8_t cool_u8 = (uint8_t)cool;
 
     app_periph_ensure_pwm(app);
-    esp_err_t err = pwm_led_set_percent(&app->pwm, warm_u8, cool_u8);
+    // Smooth fade to target using hardware fade; keep a moderate fade time to improve visible gradient.
+    const uint32_t fade_ms = 300;
+    esp_err_t err = pwm_led_fade_percent(&app->pwm, warm_u8, cool_u8, fade_ms);
+    static int64_t s_last_mix_log_us;
+    int64_t now_us = esp_timer_get_time();
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "light mix: total=%u%% ct=%u%% -> warm=%u%% cool=%u%%", (unsigned)total_brightness_0_100, (unsigned)color_temp_0_100, (unsigned)warm_u8, (unsigned)cool_u8);
+        if (s_last_mix_log_us == 0 || (now_us - s_last_mix_log_us) >= 3000000LL) {
+            ESP_LOGI(TAG, "light mix: total=%u%% ct=%u%% -> warm=%u%% cool=%u%%",
+                     (unsigned)total_brightness_0_100,
+                     (unsigned)color_temp_0_100,
+                     (unsigned)warm_u8,
+                     (unsigned)cool_u8);
+            s_last_mix_log_us = now_us;
+        }
     } else {
         ESP_LOGE(TAG, "light mix set failed: %s", esp_err_to_name(err));
     }
@@ -369,6 +403,7 @@ static bool ble_on_write_color_temp(uint8_t value_0_100, void *ctx)
     app->cfg.color_temp = value_0_100;
     (void)device_config_save(&app->cfg);
     ESP_LOGI(TAG, "color temp updated to %u (0=cool..100=warm)", (unsigned)app->cfg.color_temp);
+    app_request_light_update(app);
     return true;
 }
 
@@ -381,6 +416,7 @@ static bool ble_on_write_wake_bright(uint8_t value_0_100, void *ctx)
     app->cfg.wake_bright = value_0_100;
     (void)device_config_save(&app->cfg);
     ESP_LOGI(TAG, "wake bright updated to %u", (unsigned)app->cfg.wake_bright);
+    app_request_light_update(app);
     return true;
 }
 
@@ -499,8 +535,8 @@ static void app_ble_ensure_adv(app_ctx_t *app)
 }
 static void app_run_show_time(app_ctx_t *app, uint32_t show_ms)
 {
-    app->state = APP_STATE_ACTIVE_IDLE;
-
+    // Do not change state; allow long-press to be detected and break out to manual light.
+    // Keep advertising and display enabled during the window.
     app_periph_ensure_display(app);
     app_ble_ensure_adv(app);
 
@@ -508,7 +544,16 @@ static void app_run_show_time(app_ctx_t *app, uint32_t show_ms)
 
     while (esp_timer_get_time() < end_us) {
         app_display_show_now(app);
-        vTaskDelay(pdMS_TO_TICKS(200));
+
+        // Let long-press break out to manual light immediately.
+        button_event_t ev = button_poll(&app->btn);
+        if (ev == BUTTON_EVENT_LONG) {
+            ESP_LOGI(TAG, "show_time: long press -> manual light");
+            app_run_manual_light(app);
+            return;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     (void)ch455g_clear(&app->disp);
@@ -522,6 +567,9 @@ static void app_run_alarm_gradient(app_ctx_t *app)
     app_periph_ensure_display(app);
     app_periph_ensure_pwm(app);
 
+    // Prevent a stale release from being interpreted as an immediate SHORT cancel.
+    button_sync_state(&app->btn);
+
     uint8_t sunrise_min = app->cfg.sunrise_duration;
     if (sunrise_min < 1 || sunrise_min > 60) {
         sunrise_min = (uint8_t)DEFAULT_SUNRISE_MINUTES_FALLBACK;
@@ -531,74 +579,111 @@ static void app_run_alarm_gradient(app_ctx_t *app)
 
     int64_t total_ms = (int64_t)sunrise_min * 60 * 1000;
 
-    // Best-effort: if we woke late (after scheduled sunrise start), shorten to remaining time until alarm.
-    time_t now_s = time(NULL);
-    if (timekeeper_is_time_sane(now_s)) {
-        struct tm local;
-        localtime_r(&now_s, &local);
-        struct tm target = local;
-        target.tm_hour = app->cfg.alarm_hour;
-        target.tm_min = app->cfg.alarm_minute;
-        target.tm_sec = 0;
-        time_t alarm_t = mktime(&target);
-        if (alarm_t >= 0) {
-            if (alarm_t <= now_s) {
-                alarm_t += 24 * 60 * 60;
-            }
-            int64_t remain_ms = ((int64_t)(alarm_t - now_s)) * 1000;
-            if (remain_ms > 0 && remain_ms < total_ms) {
-                total_ms = remain_ms;
-            }
-        }
-    }
+    // Keep total_ms strictly based on sunrise_duration.
+    // Shortening based on "time until alarm" can collapse the ramp into a few seconds if the clock/alarm time
+    // is not aligned (user feedback: jumps to max brightness too fast).
+
+    ESP_LOGI(TAG, "gradient: sunrise_min=%u total_ms=%lld target_bright=%u ct=%u",
+             (unsigned)sunrise_min,
+             (long long)total_ms,
+             (unsigned)((app->cfg.wake_bright > 100) ? 100 : app->cfg.wake_bright),
+             (unsigned)((app->cfg.color_temp > 100) ? 100 : app->cfg.color_temp));
 
     int64_t start_us = esp_timer_get_time();
     int64_t end_us = start_us + total_ms * 1000;
 
+    bool canceled = false;
+
     while (esp_timer_get_time() < end_us) {
         int64_t now_us = esp_timer_get_time();
         int64_t elapsed_ms = (now_us - start_us) / 1000;
-        // Use ceil division so PWM doesn't stay at 0% for a long time at the beginning.
-        uint8_t pct = 0;
-        if (elapsed_ms <= 0) {
-            pct = 0;
-        } else if (elapsed_ms >= total_ms) {
-            pct = 100;
-        } else {
-            pct = (uint8_t)((elapsed_ms * 100 + (total_ms - 1)) / total_ms);
-            if (pct > 100) {
-                pct = 100;
-            }
-        }
 
         // Scale gradient by configured wake max brightness.
         uint8_t target = app->cfg.wake_bright;
         if (target > 100) {
             target = 100;
         }
+
+        // Exponential-ish ramp (cubic): brightness = target * progress^3.
+        // This makes the beginning even smoother than quadratic.
         uint8_t brightness = 0;
-        if (pct == 0 || target == 0) {
+        if (target == 0 || elapsed_ms <= 0) {
             brightness = 0;
+        } else if (elapsed_ms >= total_ms) {
+            brightness = target;
         } else {
-            brightness = (uint8_t)((pct * target + 99) / 100); // ceil so it's visible early
-            if (brightness > target) {
-                brightness = target;
+            // progress in Q15 (0..32768)
+            uint32_t p = (uint32_t)(((uint64_t)elapsed_ms << 15) / (uint64_t)total_ms);
+            if (p > (1u << 15)) {
+                p = (1u << 15);
             }
+            // p2 and p3 in Q15
+            uint32_t p2 = (uint32_t)(((uint64_t)p * (uint64_t)p) >> 15);
+            uint32_t p3 = (uint32_t)(((uint64_t)p2 * (uint64_t)p) >> 15);
+            uint32_t b = (uint32_t)(((uint64_t)p3 * (uint64_t)target + (1u << 14)) >> 15);
+            if (b > target) {
+                b = target;
+            }
+            brightness = (uint8_t)b;
+            // Make sure we don't stay totally dark for too long when the ramp just started.
+            if (brightness == 0) {
+                brightness = 1;
+            }
+        }
+
+        // Rate-limited progress log (helps diagnose "few seconds to full bright" cases).
+        static int64_t s_last_grad_log_us;
+        if (s_last_grad_log_us == 0 || (now_us - s_last_grad_log_us) >= 3000000LL) {
+            int64_t remain_ms = (end_us - now_us) / 1000;
+            ESP_LOGI(TAG, "gradient: elapsed=%lldms remain=%lldms bright=%u/%u", (long long)elapsed_ms, (long long)remain_ms, (unsigned)brightness, (unsigned)target);
+            s_last_grad_log_us = now_us;
         }
         app_apply_light_linear_mix(app, brightness, app->cfg.color_temp);
         app_display_show_now(app);
 
-        // short press cancels alarm -> deep sleep
+        // short press cancels alarm immediately (both during ramp and after alarm time)
         button_event_t ev = button_poll(&app->btn);
         if (ev == BUTTON_EVENT_SHORT) {
             ESP_LOGI(TAG, "alarm canceled by short press");
+            canceled = true;
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        app_wait_ms_or_light_update(500);
     }
 
-    (void)pwm_led_off(&app->pwm);
+    // After the sunrise finishes, keep light ON until user cancels with a short press.
+    // If it was canceled during ramp, turn off immediately.
+    if (canceled) {
+        (void)pwm_led_off(&app->pwm);
+    } else {
+        uint8_t target = app->cfg.wake_bright;
+        if (target > 100) {
+            target = 100;
+        }
+        app_apply_light_linear_mix(app, target, app->cfg.color_temp);
+
+        // Wait here until user short-presses to close the alarm. Allow BLE updates to change
+        // brightness/color temperature while the alarm is active.
+        button_sync_state(&app->btn);
+        for (;;) {
+            button_event_t ev = button_poll(&app->btn);
+            if (ev == BUTTON_EVENT_SHORT) {
+                ESP_LOGI(TAG, "alarm closed by short press");
+                (void)pwm_led_off(&app->pwm);
+                break;
+            }
+            if (app->light_update_pending) {
+                app->light_update_pending = false;
+                target = app->cfg.wake_bright;
+                if (target > 100) {
+                    target = 100;
+                }
+                app_apply_light_linear_mix(app, target, app->cfg.color_temp);
+            }
+            app_wait_ms_or_light_update(100);
+        }
+    }
     (void)ch455g_clear(&app->disp);
     (void)ch455g_set_enabled(&app->disp, false);
 
@@ -621,15 +706,28 @@ static void app_run_manual_light(app_ctx_t *app)
     }
     app_apply_light_linear_mix(app, manual_bright, app->cfg.color_temp);
 
+    uint8_t last_bright = manual_bright;
+    uint8_t last_ct = (app->cfg.color_temp > 100) ? 100 : app->cfg.color_temp;
+    app->light_update_pending = false;
+
     for (;;) {
         app_display_show_now(app);
 
-        // Apply settings continuously so BLE writes take effect while staying in manual mode.
-        manual_bright = app->cfg.wake_bright;
-        if (manual_bright > 100) {
-            manual_bright = 100;
+        // Apply only when changed (reduces constant fade restarts -> less noise, more responsiveness).
+        uint8_t cur_bright = app->cfg.wake_bright;
+        if (cur_bright > 100) {
+            cur_bright = 100;
         }
-        app_apply_light_linear_mix(app, manual_bright, app->cfg.color_temp);
+        uint8_t cur_ct = app->cfg.color_temp;
+        if (cur_ct > 100) {
+            cur_ct = 100;
+        }
+        if (app->light_update_pending || cur_bright != last_bright || cur_ct != last_ct) {
+            app->light_update_pending = false;
+            app_apply_light_linear_mix(app, cur_bright, cur_ct);
+            last_bright = cur_bright;
+            last_ct = cur_ct;
+        }
 
         button_event_t ev = button_poll(&app->btn);
         if (ev == BUTTON_EVENT_LONG) {
@@ -646,7 +744,7 @@ static void app_run_manual_light(app_ctx_t *app)
             app_ble_ensure_adv(app);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(200));
+        app_wait_ms_or_light_update(200);
     }
 
     (void)pwm_led_off(&app->pwm);
@@ -726,6 +824,7 @@ void app_main(void)
     }
 
     app_ctx_t app = {0};
+    app.main_task = xTaskGetCurrentTaskHandle();
     ESP_ERROR_CHECK(device_config_load(&app.cfg));
 
     ESP_ERROR_CHECK(button_init(&app.btn, GPIO_BTN, true, LONG_PRESS_MS));

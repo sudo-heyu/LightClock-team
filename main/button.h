@@ -29,6 +29,10 @@ typedef struct {
 
 esp_err_t button_init(button_t *btn, gpio_num_t gpio, bool active_low, uint32_t long_press_ms);
 
+// Sync internal state to the current GPIO level. Useful when switching modes to avoid
+// treating a previous press/release as a new event.
+void button_sync_state(button_t *btn);
+
 // For deep-sleep wake: if currently pressed, measure until release (or max_ms). Returns press duration.
 uint32_t button_measure_press_ms(button_t *btn, uint32_t max_ms);
 

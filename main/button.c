@@ -3,11 +3,26 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_log.h"
+
+static const char *TAG_BTN = "BTN";
 
 static bool is_pressed(const button_t *btn)
 {
     int lvl = gpio_get_level(btn->gpio);
     return btn->active_low ? (lvl == 0) : (lvl != 0);
+}
+
+void button_sync_state(button_t *btn)
+{
+    if (!btn) {
+        return;
+    }
+    bool pressed = is_pressed(btn);
+    int64_t now_us = esp_timer_get_time();
+    btn->last_pressed = pressed;
+    btn->press_start_us = pressed ? now_us : 0;
+    btn->long_reported = false;
 }
 
 esp_err_t button_init(button_t *btn, gpio_num_t gpio, bool active_low, uint32_t long_press_ms)
@@ -69,6 +84,7 @@ button_event_t button_poll(button_t *btn)
         btn->press_start_us = now_us;
         btn->last_pressed = true;
         btn->long_reported = false;
+        ESP_LOGI(TAG_BTN, "pressed (gpio=%d)", (int)btn->gpio);
         return BUTTON_EVENT_NONE;
     }
 
@@ -77,6 +93,7 @@ button_event_t button_poll(button_t *btn)
         uint32_t dur_ms = (uint32_t)((now_us - btn->press_start_us) / 1000);
         if (dur_ms >= btn->long_press_ms) {
             btn->long_reported = true;
+            ESP_LOGI(TAG_BTN, "long press (gpio=%d, dur=%ums)", (int)btn->gpio, (unsigned)dur_ms);
             return BUTTON_EVENT_LONG;
         }
     }
@@ -87,8 +104,10 @@ button_event_t button_poll(button_t *btn)
         btn->press_start_us = 0;
         if (btn->long_reported || dur_ms >= btn->long_press_ms) {
             btn->long_reported = false;
+            ESP_LOGI(TAG_BTN, "release after long (gpio=%d, dur=%ums)", (int)btn->gpio, (unsigned)dur_ms);
             return BUTTON_EVENT_NONE;
         }
+        ESP_LOGI(TAG_BTN, "short press (gpio=%d, dur=%ums)", (int)btn->gpio, (unsigned)dur_ms);
         return BUTTON_EVENT_SHORT;
     }
 
